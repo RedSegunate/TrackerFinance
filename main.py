@@ -62,6 +62,10 @@ if not BOT_TOKEN:
     raise SystemExit("Не задан BOT_TOKEN. Создайте бота у @BotFather и добавьте токен в .env или в Variables на Railway.")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # необязательно: без ключа бот работает по словарю
 DB_PATH = os.getenv("DB_PATH", "finance.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_SCHEMA = os.getenv("DB_SCHEMA", "tracker_finance").strip()
+if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", DB_SCHEMA):
+    raise SystemExit("DB_SCHEMA must be a lowercase PostgreSQL identifier")
 PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
@@ -82,6 +86,14 @@ INCOME_CATS = ["Зарплата", "Подработка", "Бизнес", "По
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 pending_add: set[int] = set()
+_pg_pool = None
+if DATABASE_URL:
+    try:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+    except ImportError as exc:
+        raise SystemExit("DATABASE_URL is set, but psycopg is missing; install requirements.txt") from exc
+
 claude = None
 if ANTHROPIC_API_KEY:
     from anthropic import AsyncAnthropic
@@ -89,8 +101,50 @@ if ANTHROPIC_API_KEY:
 
 
 # ---------- База данных ----------
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    @staticmethod
+    def _query(query: str) -> str:
+        return query.replace("?", "%s")
+
+    def execute(self, query: str, params=()):
+        return self.connection.execute(self._query(query), params)
+
+    def executemany(self, query: str, params):
+        return self.connection.executemany(self._query(query), params)
+
+
+def postgres_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=max(2, int(os.getenv("DB_POOL_SIZE", "5"))),
+            kwargs={"row_factory": dict_row, "prepare_threshold": None},
+            open=False,
+        )
+        _pg_pool.open(wait=True)
+    return _pg_pool
+
+
+def close_postgres_pool():
+    global _pg_pool
+    if _pg_pool is not None:
+        _pg_pool.close()
+        _pg_pool = None
+
+
 @contextmanager
 def db():
+    if DATABASE_URL:
+        with postgres_pool().connection() as conn:
+            conn.execute(f'SET LOCAL search_path TO "{DB_SCHEMA}"')
+            yield PostgresConnection(conn)
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -101,59 +155,65 @@ def db():
 
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    if DATABASE_URL:
+        with postgres_pool().connection() as conn:
+            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"')
+    else:
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with db() as c:
-        c.executescript(
-            """
+        id_type = "BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        user_id_type = "BIGINT" if DATABASE_URL else "INTEGER"
+        amount_type = "DOUBLE PRECISION" if DATABASE_URL else "REAL"
+        schema = f"""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id {user_id_type} PRIMARY KEY,
                 token TEXT UNIQUE NOT NULL,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id {id_type},
+                user_id {user_id_type} NOT NULL,
                 kind TEXT NOT NULL,
-                amount REAL NOT NULL,
+                amount {amount_type} NOT NULL,
                 category TEXT NOT NULL,
                 note TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, created_at);
             CREATE TABLE IF NOT EXISTS budgets (
-                user_id INTEGER NOT NULL,
+                user_id {user_id_type} NOT NULL,
                 category TEXT NOT NULL,
-                limit_amount REAL NOT NULL,
+                limit_amount {amount_type} NOT NULL,
                 PRIMARY KEY (user_id, category)
             );
             CREATE TABLE IF NOT EXISTS goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id {id_type},
+                user_id {user_id_type} NOT NULL,
                 title TEXT NOT NULL,
-                target_amount REAL NOT NULL,
+                target_amount {amount_type} NOT NULL,
                 icon TEXT NOT NULL DEFAULT '🎯',
-                saved_amount REAL NOT NULL DEFAULT 0,
+                saved_amount {amount_type} NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS user_settings (
-                user_id INTEGER PRIMARY KEY,
+                user_id {user_id_type} PRIMARY KEY,
                 theme TEXT NOT NULL DEFAULT 'system',
                 timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
                 budget_notifications INTEGER NOT NULL DEFAULT 1,
                 weekly_summary INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS deleted_transactions (
-                tx_id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
+                tx_id {user_id_type} PRIMARY KEY,
+                user_id {user_id_type} NOT NULL,
                 kind TEXT NOT NULL,
-                amount REAL NOT NULL,
+                amount {amount_type} NOT NULL,
                 category TEXT NOT NULL,
                 note TEXT,
                 created_at TEXT NOT NULL,
                 deleted_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS budget_alerts (
-                user_id INTEGER NOT NULL,
+                user_id {user_id_type} NOT NULL,
                 category TEXT NOT NULL,
                 month_key TEXT NOT NULL,
                 level TEXT NOT NULL,
@@ -161,23 +221,40 @@ def init_db():
                 PRIMARY KEY (user_id, category, month_key, level)
             );
             CREATE TABLE IF NOT EXISTS weekly_reports (
-                user_id INTEGER NOT NULL,
+                user_id {user_id_type} NOT NULL,
                 week_key TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, week_key)
             );
             CREATE TABLE IF NOT EXISTS rules (
-                user_id INTEGER NOT NULL,
+                user_id {user_id_type} NOT NULL,
                 word TEXT NOT NULL,
                 category TEXT NOT NULL,
                 PRIMARY KEY (user_id, word)
             );
-            """
-        )
-        goal_columns = {row["name"] for row in c.execute("PRAGMA table_info(goals)")}
+        """
+        for statement in schema.split(";"):
+            if statement.strip():
+                c.execute(statement)
+        if DATABASE_URL:
+            for table in (
+                "users", "transactions", "budgets", "goals", "user_settings",
+                "deleted_transactions", "budget_alerts", "weekly_reports", "rules",
+            ):
+                c.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+            goal_columns = {row["column_name"] for row in c.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='goals'"
+            ).fetchall()}
+            settings_columns = {row["column_name"] for row in c.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='user_settings'"
+            ).fetchall()}
+        else:
+            goal_columns = {row["name"] for row in c.execute("PRAGMA table_info(goals)")}
+            settings_columns = {row["name"] for row in c.execute("PRAGMA table_info(user_settings)")}
         if "icon" not in goal_columns:
             c.execute("ALTER TABLE goals ADD COLUMN icon TEXT NOT NULL DEFAULT '🎯'")
-        settings_columns = {row["name"] for row in c.execute("PRAGMA table_info(user_settings)")}
         if "timezone" not in settings_columns:
             c.execute("ALTER TABLE user_settings ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Europe/Moscow'")
 
@@ -202,7 +279,7 @@ def ensure_user(user_id: int) -> str:
 def user_settings(user_id: int) -> dict:
     with db() as c:
         c.execute(
-            "INSERT OR IGNORE INTO user_settings(user_id,timezone) VALUES (?,?)",
+            "INSERT INTO user_settings(user_id,timezone) VALUES (?,?) ON CONFLICT(user_id) DO NOTHING",
             (user_id, str(TZ)),
         )
         row = c.execute("SELECT * FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
@@ -439,10 +516,10 @@ async def parse_text(text: str, user_id: int):
 # ---------- Основная логика ----------
 def month_spent(c, user_id: int, category: str) -> float:
     return c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM transactions "
+        "SELECT COALESCE(SUM(amount),0) AS total FROM transactions "
         "WHERE user_id=? AND kind='expense' AND category=? AND created_at>=?",
         (user_id, category, period_start("month", user_timezone(user_id))),
-    ).fetchone()[0]
+    ).fetchone()["total"]
 
 
 def budget_warnings(user_id: int, items):
@@ -480,7 +557,8 @@ def budget_warnings(user_id: int, items):
                 continue
             now = datetime.now(timezone.utc).isoformat()
             c.executemany(
-                "INSERT OR IGNORE INTO budget_alerts(user_id,category,month_key,level,sent_at) VALUES (?,?,?,?,?)",
+                "INSERT INTO budget_alerts(user_id,category,month_key,level,sent_at) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(user_id,category,month_key,level) DO NOTHING",
                 [(user_id, cat, month_key, item, now) for item in passed],
             )
             msgs.append(message)
@@ -495,15 +573,16 @@ def save_parsed_items(user_id: int, items) -> str:
     with db() as c:
         for it in items:
             cur = c.execute(
-                "INSERT INTO transactions(user_id,kind,amount,category,note,created_at) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO transactions(user_id,kind,amount,category,note,created_at) VALUES (?,?,?,?,?,?) RETURNING id",
                 (user_id, it["kind"], it["amount"], it["category"], it["note"], now),
             )
+            tx_id = cur.fetchone()["id"]
             label = "Расход" if it["kind"] == "expense" else "Доход"
             sign = "−" if it["kind"] == "expense" else "+"
             note = f" · {it['note']}" if it["note"] else ""
-            lines.append(f"✅ {label}: {sign}{money(it['amount'])} · {it['category']}{note}  (отмена: /del {cur.lastrowid})")
+            lines.append(f"✅ {label}: {sign}{money(it['amount'])} · {it['category']}{note}  (отмена: /del {tx_id})")
             if it["kind"] == "expense" and it["category"] == "Другое":
-                lines.append(f"❓ Категория не определена. Выберите: /cat {cur.lastrowid} Продукты (любая из /categories), и я запомню слово.")
+                lines.append(f"❓ Категория не определена. Выберите: /cat {tx_id} Продукты (любая из /categories), и я запомню слово.")
     lines += budget_warnings(user_id, items)
     return "\n".join(lines)
 
@@ -517,9 +596,9 @@ def stats_data(user_id: int, period: str) -> dict:
     with db() as c:
         def total(kind):
             return c.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE user_id=? AND kind=? AND created_at>=?",
+                "SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE user_id=? AND kind=? AND created_at>=?",
                 (user_id, kind, since),
-            ).fetchone()[0]
+            ).fetchone()["total"]
         inc, exp = total("income"), total("expense")
         cats = c.execute(
             "SELECT category, SUM(amount) s FROM transactions "
@@ -536,13 +615,13 @@ def stats_data(user_id: int, period: str) -> dict:
 def overall_balance(user_id: int) -> float:
     with db() as c:
         income = c.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE user_id=? AND kind='income'",
+            "SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE user_id=? AND kind='income'",
             (user_id,),
-        ).fetchone()[0]
+        ).fetchone()["total"]
         expense = c.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE user_id=? AND kind='expense'",
+            "SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE user_id=? AND kind='expense'",
             (user_id,),
-        ).fetchone()[0]
+        ).fetchone()["total"]
     return income - expense
 
 
@@ -604,10 +683,10 @@ def financial_insights(user_id: int, period: str, stats: dict) -> list[str]:
         previous_start = (current_start - timedelta(days=7)).isoformat()
         with db() as c:
             previous_expense = c.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM transactions "
+                "SELECT COALESCE(SUM(amount),0) AS total FROM transactions "
                 "WHERE user_id=? AND kind='expense' AND created_at>=? AND created_at<?",
                 (user_id, previous_start, current_start.isoformat()),
-            ).fetchone()[0]
+            ).fetchone()["total"]
         if previous_expense > 0:
             change = (stats["expense"] - previous_expense) / previous_expense * 100
             if abs(change) >= 1:
@@ -1176,7 +1255,8 @@ async def weekly_summary_loop():
                 continue
             with db() as c:
                 c.execute(
-                    "INSERT OR IGNORE INTO weekly_reports(user_id,week_key,sent_at) VALUES (?,?,?)",
+                    "INSERT INTO weekly_reports(user_id,week_key,sent_at) VALUES (?,?,?) "
+                    "ON CONFLICT(user_id,week_key) DO NOTHING",
                     (user_id, week_key, datetime.now(timezone.utc).isoformat()),
                 )
         await asyncio.sleep(300)
@@ -1244,8 +1324,10 @@ async def api_app_delete_transaction(request: web.Request):
         if not row:
             return web.json_response({"ok": False, "error": "Запись не найдена"}, status=404)
         c.execute(
-            "INSERT OR REPLACE INTO deleted_transactions(tx_id,user_id,kind,amount,category,note,created_at,deleted_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO deleted_transactions(tx_id,user_id,kind,amount,category,note,created_at,deleted_at) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(tx_id) DO UPDATE SET "
+            "user_id=excluded.user_id,kind=excluded.kind,amount=excluded.amount,category=excluded.category,"
+            "note=excluded.note,created_at=excluded.created_at,deleted_at=excluded.deleted_at",
             (row["id"], user_id, row["kind"], row["amount"], row["category"], row["note"],
              row["created_at"], datetime.now(timezone.utc).isoformat()),
         )
@@ -1501,10 +1583,10 @@ async def api_app_goals(request: web.Request):
         return web.json_response({"ok": False, "error": "Укажите название и сумму цели больше нуля"}, status=400)
     with db() as c:
         cur = c.execute(
-            "INSERT INTO goals(user_id,title,target_amount,icon,saved_amount,created_at) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO goals(user_id,title,target_amount,icon,saved_amount,created_at) VALUES (?,?,?,?,?,?) RETURNING id",
             (user_id, title, target, icon, initial, datetime.now(timezone.utc).isoformat()),
         )
-        goal_id = cur.lastrowid
+        goal_id = cur.fetchone()["id"]
     return web.json_response({"ok": True, "id": goal_id})
 
 
@@ -1601,6 +1683,7 @@ async def main():
     finally:
         summary_task.cancel()
         await asyncio.gather(summary_task, return_exceptions=True)
+        close_postgres_pool()
 
 
 if __name__ == "__main__":

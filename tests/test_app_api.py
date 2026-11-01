@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -27,6 +27,18 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         main.DB_PATH = self.original_db_path
         main.ALLOWED_USERS = self.original_allowed_users
         self.temp_dir.cleanup()
+
+    def test_postgres_adapter_translates_placeholders(self):
+        raw_connection = Mock()
+        connection = main.PostgresConnection(raw_connection)
+        connection.execute(
+            "SELECT id FROM transactions WHERE user_id=? AND kind=?",
+            (123456789, "expense"),
+        )
+        raw_connection.execute.assert_called_once_with(
+            "SELECT id FROM transactions WHERE user_id=%s AND kind=%s",
+            (123456789, "expense"),
+        )
 
     async def test_app_page_and_authentication(self):
         page = await self.client.get("/app")
