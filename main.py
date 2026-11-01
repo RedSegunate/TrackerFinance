@@ -61,6 +61,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("Не задан BOT_TOKEN. Создайте бота у @BotFather и добавьте токен в .env или в Variables на Railway.")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # необязательно: без ключа бот работает по словарю
+AI_ENABLED = os.getenv("AI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 DB_PATH = os.getenv("DB_PATH", "finance.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_SCHEMA = os.getenv("DB_SCHEMA", "tracker_finance").strip()
@@ -70,8 +71,9 @@ PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
-# Необязательно: список Telegram ID, которым разрешено пользоваться ботом (через запятую)
+# Пустой ALLOWED_USERS означает, что бот открыт всем пользователям Telegram.
 ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+ADMIN_USERS = {int(x) for x in os.getenv("ADMIN_USERS", "").replace(" ", "").split(",") if x}
 APP_DEV = os.getenv("APP_DEV", "").lower() in ("1", "true", "yes")
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
 BOT_USERNAME = "financetrackertjk_bot"
@@ -95,9 +97,11 @@ if DATABASE_URL:
         raise SystemExit("DATABASE_URL is set, but psycopg is missing; install requirements.txt") from exc
 
 claude = None
-if ANTHROPIC_API_KEY:
+if AI_ENABLED and ANTHROPIC_API_KEY:
     from anthropic import AsyncAnthropic
     claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+elif AI_ENABLED:
+    log.warning("AI_ENABLED is set, but ANTHROPIC_API_KEY is missing; using the local parser")
 
 
 # ---------- База данных ----------
@@ -259,8 +263,12 @@ def init_db():
             c.execute("ALTER TABLE user_settings ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Europe/Moscow'")
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USERS
+
+
 def allowed(user_id: int) -> bool:
-    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+    return user_id in ADMIN_USERS or not ALLOWED_USERS or user_id in ALLOWED_USERS
 
 
 def ensure_user(user_id: int) -> str:
@@ -923,6 +931,24 @@ async def cmd_month(m: Message):
 @dp.message(Command("year"))
 async def cmd_year(m: Message):
     await m.answer(stats_text(m.from_user.id, "year"))
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Эта команда доступна только администратору.")
+    with db() as c:
+        users = c.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
+        operations = c.execute("SELECT COUNT(*) AS total FROM transactions").fetchone()["total"]
+        budgets = c.execute("SELECT COUNT(*) AS total FROM budgets").fetchone()["total"]
+        goals = c.execute("SELECT COUNT(*) AS total FROM goals").fetchone()["total"]
+    await m.answer(
+        "🛡 Панель администратора\n"
+        f"Пользователей: {users}\n"
+        f"Операций: {operations}\n"
+        f"Бюджетов: {budgets}\n"
+        f"Целей: {goals}"
+    )
 
 
 @dp.message(Command("categories"))
@@ -1663,6 +1689,7 @@ async def main():
         BotCommand(command="last", description="Последние операции"),
         BotCommand(command="budgets", description="Текущие бюджеты"),
         BotCommand(command="export", description="Скачать Excel"),
+        BotCommand(command="admin", description="Сводка администратора"),
         BotCommand(command="help", description="Справка"),
     ])
     if PUBLIC_URL:

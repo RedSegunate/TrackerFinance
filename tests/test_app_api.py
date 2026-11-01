@@ -40,6 +40,23 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
             (123456789, "expense"),
         )
 
+    def test_admin_access_policy(self):
+        original_allowed_users = main.ALLOWED_USERS
+        original_admin_users = main.ADMIN_USERS
+        try:
+            main.ADMIN_USERS = {123456789}
+            main.ALLOWED_USERS = set()
+            self.assertTrue(main.allowed(123456789))
+            self.assertTrue(main.allowed(987654321))
+
+            main.ALLOWED_USERS = {987654321}
+            self.assertTrue(main.allowed(123456789))
+            self.assertTrue(main.allowed(987654321))
+            self.assertFalse(main.allowed(111222333))
+        finally:
+            main.ALLOWED_USERS = original_allowed_users
+            main.ADMIN_USERS = original_admin_users
+
     async def test_app_page_and_authentication(self):
         page = await self.client.get("/app")
         script = await self.client.get("/assets/app.js")

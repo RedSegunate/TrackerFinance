@@ -15,13 +15,19 @@ The web server listens on `PORT` (default `8080`). The Mini App is served at `/a
 Render runs the primary Python bot with `python main.py`. Set at least:
 
 - `BOT_TOKEN`
-- `ALLOWED_USERS` for a private deployment
+- `ALLOWED_USERS` empty for a public multi-user bot (or a comma-separated allowlist for a private bot)
+- `ADMIN_USERS` with administrator Telegram IDs, e.g. `123456789`
+- `AI_ENABLED=0` to keep AI parsing disabled (the optional API key is not used unless explicitly enabled)
 - `DATABASE_URL` from Supabase Dashboard → **Connect** → **Session pooler**
 - `DB_SCHEMA=tracker_finance` (this is the default)
 - `PUBLIC_URL` to the generated HTTPS domain
 - `TIMEZONE`
 
-The app creates its tables in the private `tracker_finance` PostgreSQL schema on startup; existing tables in Supabase's `public` schema are left untouched. No Render disk is needed when `DATABASE_URL` is configured. Without it, the app uses local SQLite, which is not persistent across Render instance replacement. Existing SQLite records are not automatically copied to Supabase. `ANTHROPIC_API_KEY` is optional and enables Claude parsing for free-text financial messages.
+The app creates its tables in the private `tracker_finance` PostgreSQL schema on startup; existing tables in Supabase's `public` schema are left untouched. No Render disk is needed when `DATABASE_URL` is configured. Without it, the app uses local SQLite, which is not persistent across Render instance replacement. Existing SQLite records are not automatically copied to Supabase. AI is disabled by default; set `AI_ENABLED=1` and `ANTHROPIC_API_KEY` to enable Claude parsing for free-text messages.
+
+When `ALLOWED_USERS` is empty, any Telegram user can register and use the bot with isolated per-user data. IDs listed in `ADMIN_USERS` always retain access and can use `/admin` to see aggregate record counts only. This command does not show users' individual transactions or financial amounts.
+
+Send `/admin` from the account listed in `ADMIN_USERS` to view the aggregate user/record counts. This administrator setting does not grant access to users' individual financial records.
 
 ## Migrate existing SQLite data
 
