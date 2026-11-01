@@ -1,0 +1,6 @@
+aiogram>=3.13,<4
+aiohttp>=3.9
+openpyxl>=3.1
+tzdata
+# Необязательно: раскомментируйте, если захотите подключить ИИ (ключ Claude API)
+anthropic>=0.40

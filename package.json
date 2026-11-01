@@ -1,0 +1,16 @@
+{
+  "name": "finance-tracker-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/bot.js",
+    "start": "node src/bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.0",
+    "xlsx": "^0.18.5"
+  }
+}
