@@ -230,6 +230,18 @@ def init_db():
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, week_key)
             );
+            CREATE TABLE IF NOT EXISTS assistant_usage (
+                user_id {user_id_type} NOT NULL,
+                day_key TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day_key)
+            );
+            CREATE TABLE IF NOT EXISTS assistant_usage (
+                user_id {user_id_type} NOT NULL,
+                day_key TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day_key)
+            );
             CREATE TABLE IF NOT EXISTS rules (
                 user_id {user_id_type} NOT NULL,
                 word TEXT NOT NULL,
@@ -243,7 +255,7 @@ def init_db():
         if DATABASE_URL:
             for table in (
                 "users", "transactions", "budgets", "goals", "user_settings",
-                "deleted_transactions", "budget_alerts", "weekly_reports", "rules",
+                "deleted_transactions", "budget_alerts", "weekly_reports", "assistant_usage", "rules",
             ):
                 c.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
             goal_columns = {row["column_name"] for row in c.execute(
@@ -613,11 +625,23 @@ def stats_data(user_id: int, period: str) -> dict:
             "WHERE user_id=? AND kind='expense' AND created_at>=? GROUP BY category ORDER BY s DESC",
             (user_id, since),
         ).fetchall()
+        income_cats = c.execute(
+            "SELECT category, SUM(amount) s FROM transactions "
+            "WHERE user_id=? AND kind='income' AND created_at>=? GROUP BY category ORDER BY s DESC",
+            (user_id, since),
+        ).fetchall()
     categories = [
         {"category": r["category"], "amount": r["s"], "share": (r["s"] / exp * 100 if exp else 0)}
         for r in cats
     ]
-    return {"period": period, "income": inc, "expense": exp, "balance": inc - exp, "categories": categories}
+    income_categories = [
+        {"category": r["category"], "amount": r["s"], "share": (r["s"] / inc * 100 if inc else 0)}
+        for r in income_cats
+    ]
+    return {
+        "period": period, "income": inc, "expense": exp, "balance": inc - exp,
+        "categories": categories, "income_categories": income_categories,
+    }
 
 
 def overall_balance(user_id: int) -> float:
@@ -633,7 +657,7 @@ def overall_balance(user_id: int) -> float:
     return income - expense
 
 
-def analytics_series(user_id: int, period: str) -> list[dict]:
+def analytics_series(user_id: int, period: str, kind: str = "expense") -> list[dict]:
     tz = user_timezone(user_id)
     now = datetime.now(tz)
     if period == "today":
@@ -656,8 +680,8 @@ def analytics_series(user_id: int, period: str) -> list[dict]:
     totals = {label: 0.0 for _, label in buckets}
     with db() as c:
         rows = c.execute(
-            "SELECT created_at, amount FROM transactions WHERE user_id=? AND kind='expense' AND created_at>=?",
-            (user_id, since),
+            "SELECT created_at, amount FROM transactions WHERE user_id=? AND kind=? AND created_at>=?",
+            (user_id, kind, since),
         ).fetchall()
     for row in rows:
         created = local_dt(row["created_at"], tz)
@@ -1178,6 +1202,10 @@ async def app_script(_request: web.Request):
     return web.FileResponse(os.path.join(WEBAPP_DIR, "app.js"))
 
 
+async def app_styles(_request: web.Request):
+    return web.FileResponse(os.path.join(WEBAPP_DIR, "design-system.css"))
+
+
 async def api_app_me(request: web.Request):
     user_id = await require_app_user(request)
     ensure_user(user_id)
@@ -1186,6 +1214,8 @@ async def api_app_me(request: web.Request):
     return web.json_response({
         "ok": True,
         "categories": {"expense": EXPENSE_CATS, "income": INCOME_CATS},
+        "ai_enabled": bool(AI_ENABLED and claude is not None),
+        "ai_enabled": bool(AI_ENABLED and claude is not None),
         "display_name": telegram_user.get("first_name", "Друг"),
         "user_id": user_id,
         "overall_balance": overall_balance(user_id),
@@ -1239,7 +1269,7 @@ async def api_app_export(request: web.Request):
 async def api_app_delete_data(request: web.Request):
     user_id = await require_app_user(request)
     with db() as c:
-        for table in ("transactions", "budgets", "goals", "rules", "budget_alerts", "weekly_reports", "deleted_transactions"):
+        for table in ("transactions", "budgets", "goals", "rules", "budget_alerts", "weekly_reports", "assistant_usage", "deleted_transactions"):
             c.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
     return web.json_response({"ok": True})
 
@@ -1291,16 +1321,87 @@ async def weekly_summary_loop():
 async def api_app_stats(request: web.Request):
     user_id = await require_app_user(request)
     period = request.query.get("period", "today")
+    kind = request.query.get("kind", "expense")
     if period not in {"today", "week", "month", "year"}:
         return web.json_response({"ok": False, "error": "invalid period"}, status=400)
+    if kind not in {"expense", "income"}:
+        return web.json_response({"ok": False, "error": "invalid kind"}, status=400)
     stats = stats_data(user_id, period)
     return web.json_response({
         "ok": True,
         **stats,
         "overall_balance": overall_balance(user_id),
-        "series": analytics_series(user_id, period),
+        "series": analytics_series(user_id, period, kind),
         "insights": financial_insights(user_id, period, stats),
     })
+
+
+async def api_app_assistant(request: web.Request):
+    user_id = await require_app_user(request)
+    if not AI_ENABLED or claude is None:
+        return web.json_response({"ok": False, "error": "Советник пока выключен"}, status=503)
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, web.HTTPBadRequest):
+        return web.json_response({"ok": False, "error": "Некорректный JSON"}, status=400)
+    question = str(data.get("question", "")).strip()
+    if not question or len(question) > 500:
+        return web.json_response({"ok": False, "error": "Вопрос должен быть от 1 до 500 символов"}, status=400)
+
+    day_key = datetime.now(user_timezone(user_id)).date().isoformat()
+    with db() as c:
+        c.execute(
+            "INSERT INTO assistant_usage(user_id,day_key,requests) VALUES (?,?,0) "
+            "ON CONFLICT(user_id,day_key) DO NOTHING",
+            (user_id, day_key),
+        )
+        quota = c.execute(
+            "UPDATE assistant_usage SET requests=requests+1 "
+            "WHERE user_id=? AND day_key=? AND requests<20",
+            (user_id, day_key),
+        )
+        if not quota.rowcount:
+            return web.json_response({"ok": False, "error": "Достигнут дневной лимит вопросов"}, status=429)
+        totals = {
+            "users_month": stats_data(user_id, "month"),
+            "balance": overall_balance(user_id),
+            "categories": [dict(row) for row in c.execute(
+                "SELECT category, SUM(amount) AS amount FROM transactions "
+                "WHERE user_id=? AND kind='expense' AND created_at>=? "
+                "GROUP BY category ORDER BY amount DESC LIMIT 8",
+                (user_id, period_start("month", user_timezone(user_id))),
+            ).fetchall()],
+        }
+        budgets = [dict(row) for row in c.execute(
+            "SELECT category, limit_amount FROM budgets WHERE user_id=? ORDER BY category LIMIT 12",
+            (user_id,),
+        ).fetchall()]
+        goals = [dict(row) for row in c.execute(
+            "SELECT title, target_amount, saved_amount FROM goals WHERE user_id=? ORDER BY id DESC LIMIT 8",
+            (user_id,),
+        ).fetchall()]
+    context = {**totals, "budgets": budgets, "goals": goals}
+    try:
+        response = await claude.messages.create(
+            model=MODEL,
+            max_tokens=500,
+            system=(
+                "Ты — краткий финансовый помощник. Отвечай только по-русски и основывайся только на переданных агрегатах. "
+                "Не выдумывай факты, не утверждай, что менял данные, не обещай доходность и не давай инвестиционных гарантий. "
+                "Если данных недостаточно, скажи об этом. Предложения только информационные; никаких действий без подтверждения."
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"Сводные данные в рублях: {json.dumps(context, ensure_ascii=False)}\nВопрос: {question}",
+            }],
+        )
+        answer = "".join(block.text for block in response.content if block.type == "text").strip()
+        if not answer:
+            raise ValueError("Empty assistant response")
+    except Exception:
+        log.exception("AI advisor request failed for user %s", user_id)
+        return web.json_response({"ok": False, "error": "Советник временно недоступен"}, status=502)
+    return web.json_response({"ok": True, "answer": answer})
 
 
 async def api_app_transactions(request: web.Request):
@@ -1656,8 +1757,10 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/add", api_add)
     app.router.add_get("/app", app_index)
     app.router.add_get("/assets/app.js", app_script)
+    app.router.add_get("/assets/design-system.css", app_styles)
     app.router.add_get("/api/app/me", api_app_me)
     app.router.add_get("/api/app/stats", api_app_stats)
+    app.router.add_post("/api/app/assistant", api_app_assistant)
     app.router.add_get("/api/app/transactions", api_app_transactions)
     app.router.add_patch(r"/api/app/transactions/{tx_id:\d+}", api_app_update_transaction)
     app.router.add_delete(r"/api/app/transactions/{tx_id:\d+}", api_app_delete_transaction)

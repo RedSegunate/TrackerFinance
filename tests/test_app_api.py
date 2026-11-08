@@ -60,12 +60,15 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_app_page_and_authentication(self):
         page = await self.client.get("/app")
         script = await self.client.get("/assets/app.js")
+        styles = await self.client.get("/assets/design-system.css")
         unauthorized = await self.client.get("/api/app/me")
 
         self.assertEqual(page.status, 200)
-        self.assertIn('data-s="analytics"', await page.text())
+        self.assertIn('id="sc-stats"', await page.text())
         self.assertEqual(script.status, 200)
-        self.assertIn("loadAnalytics", await script.text())
+        self.assertIn("loadStats", await script.text())
+        self.assertEqual(styles.status, 200)
+        self.assertIn("--accent", await styles.text())
         self.assertEqual(unauthorized.status, 401)
 
     async def test_transaction_edit_delete_and_restore(self):
