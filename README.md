@@ -1,4 +1,14 @@
-# Tracker Finance 2.0
+# Tracker Finance 3.0
+
+## What's new in 3.0
+
+- New Mini App design from the design system (`webapp/design-system.css`): light and dark themes, Telegram theme colors, bottom tab bar, add-operation sheet with a numpad.
+- New home screen: balance, "safe to spend per day", tip, budgets and goals.
+- Operations: search, filters, swipe left to delete with undo, edit sheet.
+- Analytics: category donut, spending pace with forecast, income and expense by month.
+- Budgets and goals on a separate screen; AI advisor chat; settings screen.
+- New route `/assets/design-system.css` in `main.py`.
+
 
 The primary application is the Python Telegram bot in `main.py` with its Telegram Mini App in `webapp/`. In deployment it uses Supabase PostgreSQL; local development can fall back to SQLite. The currency is RUB.
 
